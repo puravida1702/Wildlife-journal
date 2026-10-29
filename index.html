@@ -214,7 +214,7 @@ textarea.notes::placeholder{color:var(--muted); font-style:italic}
 <nav class="bar" aria-label="Main">
   <button class="navb" id="tab-index" type="button" aria-pressed="true">Index</button>
   <button class="navb" id="add" type="button">Add</button>
-  <button class="navb" id="import" type="button">Import</button>
+  <button class="navb" id="import" type="button">Data</button>
 </nav>
 <input type="file" id="csv" accept=".csv,text/csv" aria-label="iNaturalist CSV file">
 
@@ -867,12 +867,80 @@ textarea.notes::placeholder{color:var(--muted); font-style:italic}
     });
     if(!incoming.length) throw new Error('rows');
     var old={}; obs.forEach(function(o){ if(!o.sample) old[o.id]=o });
-    incoming.forEach(function(o){ if(old[o.id]&&old[o.id].hasPhoto) o.hasPhoto=true; old[o.id]=o });
+    incoming.forEach(function(o){ var e=old[o.id]; if(e){ if(e.hasPhoto) o.hasPhoto=true; if(e.noPic) o.noPic=true; if(e.crop) o.crop=e.crop; } old[o.id]=o });
     obs=Object.keys(old).map(function(k){return old[k]});
     isSample=false;
     return {n:incoming.length,img:withImg};
   }
-  $('#import').addEventListener('click',function(){$('#csv').click()});
+  /* import, backup and restore */
+  function openData(){
+    var p=$('#panel'); p.textContent='';
+    var status=h('p',{class:'note'},'Your journal is stored on this phone only. Make a backup now and then, and keep the file somewhere safe, for example in Google Drive.');
+    get('lastBackup').then(function(d){ if(d) status.textContent='Last backup: '+fmt(d)+'. Your journal is stored on this phone only, so make a new backup after adding pictures or notes.'; });
+    p.appendChild(h('h2',null,'Import and backup'));
+    p.appendChild(status);
+    p.appendChild(sec('Backup'));
+    p.appendChild(h('div',{class:'btnrow'},
+      h('button',{class:'btn solid',type:'button',on:{click:function(){ status.textContent='Preparing the backup...'; makeBackup().then(function(n){ status.textContent='Backup file created ('+n+'). Your phone saves it, usually in Downloads. Keep a copy somewhere safe.'; }).catch(function(){ status.textContent='The backup could not be created.'; }); }}},'Back up my journal'),
+      h('button',{class:'btn',type:'button',on:{click:function(){ pickBackup(status); }}},'Restore a backup')));
+    p.appendChild(sec('iNaturalist'));
+    p.appendChild(h('div',{class:'btnrow'},
+      h('button',{class:'btn',type:'button',on:{click:function(){ closeSheet(); $('#csv').click(); }}},'Import iNaturalist file')));
+    p.appendChild(h('div',{class:'btnrow'},h('button',{class:'btn quiet',type:'button',on:{click:closeSheet}},'Close')));
+    openSheet();
+  }
+  function makeBackup(){
+    var ids=obs.filter(function(o){return o.hasPhoto}).map(function(o){return o.id}).concat(extras.map(function(x){return x.id}));
+    var photos={};
+    return Promise.all(ids.map(function(id){ return getPhoto(id).then(function(d){ if(d) photos[id]=d; }); })).then(function(){
+      var data={app:'wildlife-journal',version:2,date:today(),obs:obs,extras:extras,covers:covers,names:names,notes:notes,photos:photos};
+      var blob=new Blob([JSON.stringify(data)],{type:'application/json'});
+      var name='wildlife-journal-backup-'+today()+'.json';
+      var url=URL.createObjectURL(blob), a=document.createElement('a');
+      a.href=url; a.download=name; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function(){URL.revokeObjectURL(url)},60000);
+      return put('lastBackup',today()).then(function(){ return name; });
+    });
+  }
+  function pickBackup(status){
+    var inp=h('input',{type:'file',accept:'.json,application/json','aria-label':'Choose a backup file'});
+    document.body.appendChild(inp);
+    inp.addEventListener('change',function(){
+      var f=inp.files&&inp.files[0]; document.body.removeChild(inp); if(!f) return;
+      var r=new FileReader();
+      r.onload=function(){
+        var d=null; try{ d=JSON.parse(String(r.result)); }catch(e){}
+        if(!d||d.app!=='wildlife-journal'||!Array.isArray(d.obs)){ status.textContent='This is not a Wildlife Journal backup file.'; return; }
+        confirmRestore(d);
+      };
+      r.onerror=function(){ status.textContent='The file could not be read.'; };
+      r.readAsText(f);
+    });
+    inp.click();
+  }
+  function confirmRestore(d){
+    var p=$('#panel'); p.textContent='';
+    var np=Object.keys(d.photos||{}).length;
+    p.appendChild(h('h2',null,'Restore this backup?'));
+    p.appendChild(h('p',{class:'note'},'Backup of '+fmt(d.date)+': '+d.obs.length+' sightings and '+np+(np===1?' picture':' pictures')+' of your own. It replaces what is in the app now.'));
+    p.appendChild(h('div',{class:'btnrow'},
+      h('button',{class:'btn solid',type:'button',on:{click:function(){ doRestore(d); }}},'Yes, restore'),
+      h('button',{class:'btn quiet',type:'button',on:{click:openData}},'Cancel')));
+    openSheet();
+  }
+  function doRestore(d){
+    var photos=d.photos||{}, ids=Object.keys(photos);
+    photoCache={};
+    Promise.all(ids.map(function(id){ photoCache[id]=photos[id]; return put('photo:'+id,photos[id]); })).then(function(){
+      obs=d.obs.map(fixName); extras=d.extras||[]; covers=d.covers||{}; names=d.names||{}; notes=d.notes||{}; isSample=false;
+      return Promise.all([saveObs(),saveExtras(),saveCovers(),saveNames(),saveNotes()]);
+    }).then(function(){
+      state.q=''; state.taxon='all'; state.limit=60; $('#q').value='';
+      closeSheet(); say('Backup restored: '+obs.length+' sightings.');
+      if(location.hash&&location.hash!=='#') location.hash=''; else { state.sp=null; render(); window.scrollTo(0,0); }
+    });
+  }
+  $('#import').addEventListener('click',openData);
   $('#csv').addEventListener('change',function(){
     var f=this.files&&this.files[0], inp=this; if(!f) return;
     var r=new FileReader();
