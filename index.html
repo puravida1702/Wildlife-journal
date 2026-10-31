@@ -285,6 +285,7 @@ textarea.notes::placeholder{color:var(--muted); font-style:italic}
     });
   }
   function put(k,v){
+    if(!sync.suppress && k.indexOf('photo:')===0){ sync.dirty[k.slice(6)]=1; saveDirty(); }
     memory[k]=v;
     return db().then(function(d){
       if(!d) return;
@@ -304,11 +305,11 @@ textarea.notes::placeholder{color:var(--muted); font-style:italic}
       });
     });
   }
-  function saveObs(){ return put('obs',obs); }
-  function saveExtras(){ return put('extras',extras); }
-  function saveCovers(){ return put('covers',covers); }
-  function saveNames(){ return put('names',names); }
-  function saveNotes(){ return put('notes',notes); }
+  function saveObs(){ return put('obs',obs).then(function(r){ syncSoon(); return r; }); }
+  function saveExtras(){ return put('extras',extras).then(function(r){ syncSoon(); return r; }); }
+  function saveCovers(){ return put('covers',covers).then(function(r){ syncSoon(); return r; }); }
+  function saveNames(){ return put('names',names).then(function(r){ syncSoon(); return r; }); }
+  function saveNotes(){ return put('notes',notes).then(function(r){ syncSoon(); return r; }); }
   function getPhoto(id){
     if(photoCache[id]!==undefined) return Promise.resolve(photoCache[id]);
     return get('photo:'+id).then(function(v){photoCache[id]=v||null; return photoCache[id]});
@@ -883,6 +884,22 @@ textarea.notes::placeholder{color:var(--muted); font-style:italic}
     p.appendChild(h('div',{class:'btnrow'},
       h('button',{class:'btn solid',type:'button',on:{click:function(){ status.textContent='Preparing the backup...'; makeBackup().then(function(n){ status.textContent='Backup file created ('+n+'). Your phone saves it, usually in Downloads. Keep a copy somewhere safe.'; }).catch(function(){ status.textContent='The backup could not be created.'; }); }}},'Back up my journal'),
       h('button',{class:'btn',type:'button',on:{click:function(){ pickBackup(status); }}},'Restore a backup')));
+    p.appendChild(sec('Sync between phones'));
+    p.appendChild(h('p',{class:'note',id:'sync-status'},syncText()));
+    var kin=h('input',{id:'sync-key',type:'text',autocomplete:'off',autocapitalize:'none',spellcheck:'false',placeholder:'for example: toucan2026',value:sync.key||'','aria-label':'Sync key'});
+    p.appendChild(h('div',{class:'field'},h('label',{class:'label',for:'sync-key'},'Sync key'),kin));
+    var srow=h('div',{class:'btnrow'},
+      h('button',{class:'btn solid',type:'button',on:{click:function(){
+        var k=kin.value.trim().toLowerCase();
+        if(k.length<4){ document.getElementById('sync-status').textContent='Use a key of at least 4 characters.'; return; }
+        setSyncKey(k);
+      }}},sync.key?'Change key':'Start sync'));
+    if(sync.key){
+      srow.appendChild(h('button',{class:'btn',type:'button',on:{click:function(){ syncNow(); }}},'Sync now'));
+      srow.appendChild(h('button',{class:'btn quiet',type:'button',on:{click:function(){ stopSync(); }}},'Stop sync'));
+    }
+    p.appendChild(srow);
+    p.appendChild(h('p',{class:'note'},'Anyone who knows your key can see and change your journal, so choose one nobody can guess and share it only with people you trust.'));
     p.appendChild(sec('iNaturalist'));
     p.appendChild(h('div',{class:'btnrow'},
       h('button',{class:'btn',type:'button',on:{click:function(){ closeSheet(); $('#csv').click(); }}},'Import iNaturalist file')));
@@ -922,7 +939,7 @@ textarea.notes::placeholder{color:var(--muted); font-style:italic}
     var p=$('#panel'); p.textContent='';
     var np=Object.keys(d.photos||{}).length;
     p.appendChild(h('h2',null,'Restore this backup?'));
-    p.appendChild(h('p',{class:'note'},'Backup of '+fmt(d.date)+': '+d.obs.length+' sightings and '+np+(np===1?' picture':' pictures')+' of your own. It replaces what is in the app now.'));
+    p.appendChild(h('p',{class:'note'},'Backup of '+fmt(d.date)+': '+d.obs.length+' sightings and '+np+(np===1?' picture':' pictures')+' of your own. It replaces what is in the app now.'+(sync.key?' Sync is on, so your other phones will receive it too.':'')));
     p.appendChild(h('div',{class:'btnrow'},
       h('button',{class:'btn solid',type:'button',on:{click:function(){ doRestore(d); }}},'Yes, restore'),
       h('button',{class:'btn quiet',type:'button',on:{click:openData}},'Cancel')));
@@ -964,6 +981,183 @@ textarea.notes::placeholder{color:var(--muted); font-style:italic}
   $('#q').addEventListener('input',function(){state.q=this.value;state.limit=60;render()});
   $('#tab-index').addEventListener('click',function(){ if(location.hash&&location.hash!=='#') location.hash=''; else { state.sp=null; render(); window.scrollTo(0,0); } });
 
+  /* ---------- sync between phones (Firebase Realtime Database, plain web requests) ---------- */
+  var SYNC_DB='https://marilyn-s-recipe-default-rtdb.firebaseio.com';
+  var SYNC_KINDS=['names','notes','covers','extras','obsx'];
+  var sync={key:'',snap:{},pv:{},dirty:{},busy:null,again:false,timer:null,last:'',err:'',suppress:false,photoMsg:''};
+  var DATAIDS={}; DATA.forEach(function(o){DATAIDS[o.id]=1});
+  function kOf(s){ return encodeURIComponent(s).replace(/\./g,'%2E'); }
+  function unk(s){ try{return decodeURIComponent(s)}catch(e){return s} }
+  function sUrl(p){ return SYNC_DB+'/wildlife/'+encodeURIComponent(kOf(sync.key))+'/'+p+'.json'; }
+  function sameMap(a,b){ var ka=Object.keys(a),kb=Object.keys(b); if(ka.length!==kb.length) return false; return ka.every(function(k){return a[k]===b[k]}); }
+  function saveDirty(){ put('syncDirty',sync.dirty); }
+
+  /* what this phone holds, as one text value per record */
+  function localMaps(){
+    var m={names:{},notes:{},covers:{},extras:{},obsx:{}};
+    Object.keys(names).forEach(function(k){ m.names[kOf(k)]=JSON.stringify(names[k]); });
+    Object.keys(notes).forEach(function(k){ m.notes[kOf(k)]=JSON.stringify(notes[k]); });
+    Object.keys(covers).forEach(function(k){ m.covers[kOf(k)]=JSON.stringify(covers[k]); });
+    extras.forEach(function(x){ m.extras[kOf(x.id)]=JSON.stringify(x); });
+    var present={};
+    obs.forEach(function(o){
+      if(o.sample) return; present[o.id]=1;
+      if(DATAIDS[o.id]){
+        var p={}; if(o.noPic) p.noPic=1; if(o.hasPhoto) p.hasPhoto=1; if(o.crop) p.crop=o.crop;
+        if(Object.keys(p).length) m.obsx[kOf(o.id)]=JSON.stringify(p);
+      } else {
+        var c={}; Object.keys(o).forEach(function(f){ if(f!=='sample') c[f]=o[f]; });
+        m.obsx[kOf(o.id)]=JSON.stringify(c);
+      }
+    });
+    Object.keys(DATAIDS).forEach(function(id){ if(!present[id]) m.obsx[kOf(id)]=JSON.stringify({deleted:1}); });
+    return m;
+  }
+  /* three-way merge of one kind: remote R, local L, and what both agreed on last time S */
+  function merge3(R,L,S,ops,kind){
+    var out={}, ids={};
+    [R,L,S].forEach(function(m){ Object.keys(m).forEach(function(k){ids[k]=1}); });
+    Object.keys(ids).forEach(function(k){
+      var r=R[k], l=L[k], s=S[k], res;
+      if(l===s) res=r;
+      else if(r===s){ res=l; ops.push({kind:kind,k:k,v:l}); }
+      else if(r===l) res=r;
+      else if(r===undefined){ res=l; ops.push({kind:kind,k:k,v:l}); }
+      else res=r;
+      if(res!==undefined) out[k]=res;
+    });
+    return out;
+  }
+  /* put the merged records into this phone (objects are updated in place so open screens stay valid) */
+  function applyMaps(M,L){
+    function plain(kind){
+      var cur={}; Object.keys(M[kind]).forEach(function(k){ try{ cur[unk(k)]=JSON.parse(M[kind][k]); }catch(e){} }); return cur;
+    }
+    if(!sameMap(M.names,L.names)) names=plain('names');
+    if(!sameMap(M.notes,L.notes)) notes=plain('notes');
+    if(!sameMap(M.covers,L.covers)) covers=plain('covers');
+    if(!sameMap(M.extras,L.extras)){
+      var ex={}; extras.forEach(function(x){ex[x.id]=x});
+      var nx=[];
+      Object.keys(M.extras).forEach(function(k){ try{
+        var rec=JSON.parse(M.extras[k]), e=ex[rec.id];
+        if(e){ Object.keys(e).forEach(function(f){delete e[f]}); Object.assign(e,rec); nx.push(e); } else nx.push(rec);
+      }catch(e2){} });
+      extras=nx;
+    }
+    if(!sameMap(M.obsx,L.obsx)){
+      var patches={}, fulls=[];
+      Object.keys(M.obsx).forEach(function(k){ try{
+        var rec=JSON.parse(M.obsx[k]), id=unk(k);
+        if(DATAIDS[id]) patches[id]=rec; else fulls.push(rec);
+      }catch(e){} });
+      var by={}; obs.forEach(function(o){by[o.id]=o});
+      var next=[];
+      DATA.forEach(function(d){
+        var p=patches[d.id]; if(p&&p.deleted) return;
+        var o=by[d.id]; if(!o) o=fixName(JSON.parse(JSON.stringify(d)));
+        delete o.noPic; delete o.hasPhoto; delete o.crop;
+        if(p){ if(p.noPic) o.noPic=true; if(p.hasPhoto) o.hasPhoto=true; if(p.crop) o.crop=p.crop; }
+        next.push(o);
+      });
+      fulls.forEach(function(rec){
+        var o=by[rec.id];
+        if(o){ Object.keys(o).forEach(function(f){delete o[f]}); Object.assign(o,rec); } else o=rec;
+        next.push(fixName(o));
+      });
+      obs=next;
+    }
+  }
+  function persistAll(){ return Promise.all([put('obs',obs),put('extras',extras),put('covers',covers),put('names',names),put('notes',notes)]); }
+
+  function syncText(){
+    if(!sync.key) return 'Sync is off. Choose a key, and type the same key on your other phones.';
+    if(sync.err) return 'Not synced: '+sync.err;
+    var s=sync.last?'Synced at '+sync.last+'.':'Syncing...';
+    return s+(sync.photoMsg?' '+sync.photoMsg:'');
+  }
+  function syncStatus(){ var el=document.getElementById('sync-status'); if(el) el.textContent=syncText(); }
+  function nowText(){ var d=new Date(); return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); }
+
+  async function uploadPhoto(id,data,rpv){
+    var pv=Date.now(), k=encodeURIComponent(kOf(id));
+    var r1=await fetch(sUrl('photos/'+k),{method:'PUT',body:JSON.stringify(data)});
+    if(!r1.ok) throw new Error('picture upload '+r1.status);
+    var r2=await fetch(sUrl('photov/'+k),{method:'PUT',body:String(pv)});
+    if(!r2.ok) throw new Error('picture upload '+r2.status);
+    sync.pv[id]=pv; delete sync.dirty[id]; rpv[kOf(id)]=pv;
+  }
+  async function downloadPhoto(id,rp){
+    var r=await fetch(sUrl('photos/'+encodeURIComponent(kOf(id))));
+    if(!r.ok) throw new Error('picture download '+r.status);
+    var data=await r.json(); if(!data) return false;
+    sync.suppress=true; put('photo:'+id,data); sync.suppress=false;
+    photoCache[id]=data; sync.pv[id]=rp; delete sync.dirty[id];
+    return true;
+  }
+  async function syncPhotos(rpv){
+    var ids={}; obs.forEach(function(o){ if(o.hasPhoto) ids[o.id]=1; }); extras.forEach(function(x){ ids[x.id]=1; });
+    var list=Object.keys(ids), got=false, up=0, down=0;
+    for(var i=0;i<list.length;i++){
+      var id=list[i], local=await getPhoto(id), rp=rpv[kOf(id)], lp=sync.pv[id];
+      if(local && (sync.dirty[id] || rp===undefined)){ sync.photoMsg='Sending pictures ('+(++up)+')...'; syncStatus(); await uploadPhoto(id,local,rpv); }
+      else if((!local && rp!==undefined) || (local && rp!==undefined && lp!==rp)){
+        sync.photoMsg='Getting pictures ('+(++down)+')...'; syncStatus();
+        if(await downloadPhoto(id,rp)) got=true;
+      }
+    }
+    sync.photoMsg='';
+    await Promise.all([put('syncPv',sync.pv),put('syncDirty',sync.dirty)]);
+    if(got) render();
+  }
+
+  async function syncRun(){
+    var res=await Promise.all([fetch(sUrl('data')),fetch(sUrl('photov'))]);
+    if(res[0].status===401||res[0].status===403) throw new Error('the database rules do not allow it');
+    if(!res[0].ok||!res[1].ok) throw new Error('server answered '+res[0].status);
+    var rd=(await res[0].json())||{}, rpv=(await res[1].json())||{};
+    var L=localMaps(), M={}, ops=[], S=sync.snap||{};
+    SYNC_KINDS.forEach(function(kind){ M[kind]=merge3(rd[kind]||{},L[kind],S[kind]||{},ops,kind); });
+    var changed=SYNC_KINDS.some(function(kind){ return !sameMap(M[kind],L[kind]); });
+    if(changed){ applyMaps(M,L); }
+    if(ops.length){
+      var body={}; ops.forEach(function(op){ body[op.kind+'/'+op.k]=op.v===undefined?null:op.v; });
+      var pr=await fetch(sUrl('data'),{method:'PATCH',body:JSON.stringify(body)});
+      if(pr.status===401||pr.status===403) throw new Error('the database rules do not allow it');
+      if(!pr.ok) throw new Error('could not save, server answered '+pr.status);
+    }
+    sync.snap=M; await put('syncSnap',M);
+    if(changed){ await persistAll(); render(); }
+    await syncPhotos(rpv);
+  }
+  function syncNow(){
+    if(!sync.key||!ready) return Promise.resolve();
+    if(sync.busy){ sync.again=true; return sync.busy; }
+    sync.busy=syncRun().then(function(){ sync.err=''; sync.last=nowText(); })
+      .catch(function(e){ sync.err=(e&&e.message)||'no connection'; if(!navigator.onLine) sync.err='no connection'; })
+      .then(function(){ sync.busy=null; syncStatus(); if(sync.again){ sync.again=false; syncSoon(); } });
+    syncStatus();
+    return sync.busy;
+  }
+  function syncSoon(){ if(!sync.key) return; clearTimeout(sync.timer); sync.timer=setTimeout(syncNow,1500); }
+  function setSyncKey(k){
+    sync.key=k; sync.snap={}; sync.pv={}; sync.err=''; sync.last='';
+    return Promise.all([put('syncKey',k),put('syncSnap',{}),put('syncPv',{})]).then(function(){ syncStatus(); return syncNow(); });
+  }
+  function stopSync(){
+    sync.key=''; sync.snap={}; sync.pv={}; sync.err=''; sync.last='';
+    return Promise.all([drop('syncKey'),drop('syncSnap'),drop('syncPv')]).then(syncStatus);
+  }
+  function startSync(){
+    Promise.all([get('syncKey'),get('syncSnap'),get('syncPv'),get('syncDirty')]).then(function(r){
+      sync.key=r[0]||''; sync.snap=r[1]||{}; sync.pv=r[2]||{}; sync.dirty=r[3]||{};
+      if(sync.key) syncNow();
+    });
+    setInterval(function(){ if(!document.hidden) syncNow(); },30000);
+    document.addEventListener('visibilitychange',function(){ if(!document.hidden) syncNow(); });
+    window.addEventListener('online',function(){ syncNow(); });
+  }
+
   /* start with the imported sightings, then use saved edits if there are any */
   obs=DATA.map(fixName); route(true);
   Promise.all([get('obs'),get('extras'),get('covers'),get('names'),get('notes')]).then(function(r){
@@ -972,7 +1166,7 @@ textarea.notes::placeholder{color:var(--muted); font-style:italic}
     if(r[2]) covers=r[2];
     if(r[3]) names=r[3];
     if(r[4]) notes=r[4];
-    ready=true; route(true);
+    ready=true; route(true); startSync();
   });
 })();
 </script>
